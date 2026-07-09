@@ -9,7 +9,7 @@ from elac_tests.ELAC_TestProfilePosition import run_position_test
 from elac_tests.ELAC_TestPosition import run_singlePosition_test
 from elac_tests.ELAC_TestTrajectory import run_trajectory_test
 from elac_tests.ELAC_TestHome import run_homing_test
-
+from elac_tests.ELAC_TestBrake import run_brake_test
 
 USO = (
     "Uso:\n"
@@ -112,7 +112,23 @@ def main():
 
             print("EtherCAT: Homing CiA402", "OK" if ok else "FALLITO")
             sys.exit(0 if ok else 3)
+        elif test_type == "brake":
+            if len(sys.argv) < 3:
+                print("Errore: uso corretto:")
+                print("  Test_Ethercat.py brake <mode> [command]")
+                print("Esempi:")
+                print("  Test_Ethercat.py brake 1 1   # manuale, applica freno")
+                print("  Test_Ethercat.py brake 1 0   # manuale, rilascia freno")
+                print("  Test_Ethercat.py brake 0     # automatico")
+                sys.exit(1)
 
+            mode = int(sys.argv[2])
+            command = int(sys.argv[3]) if len(sys.argv) >= 4 else None
+
+            ok = run_brake_test(elac, mode, command)
+
+            print("EtherCAT: Test freno", "OK" if ok else "FALLITO")
+            sys.exit(0 if ok else 3)
         else:
             print("Errore: tipo di test non riconosciuto. Usa 'pos' o 'vel'.")
             print(USO)
