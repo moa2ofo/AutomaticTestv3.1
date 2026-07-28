@@ -1,0 +1,5 @@
+# Cache Python
+elac_tests/__pycache__/
+
+# Risultati test
+elac_tests/test_results/
