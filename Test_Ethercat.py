@@ -10,6 +10,7 @@ from elac_tests.ELAC_TestPosition import run_singlePosition_test
 from elac_tests.ELAC_TestTrajectory import run_trajectory_test
 from elac_tests.ELAC_TestHome import run_homing_test
 from elac_tests.ELAC_TestBrake import run_brake_test
+from elac_tests.ELAC_PrintObjectDictionary import read_object_dictionary
 
 USO = (
     "Uso:\n"
@@ -78,7 +79,10 @@ def main():
             ok = run_trajectory_test(elac, delta_angle,time_based_ms,final_angle_target, stop_file=stop_file)
             print("EtherCAT: Test di posizione", "OK" if ok else "FALLITO")
             sys.exit(0 if ok else 3)
-
+        elif test_type == "read":
+            ok = read_object_dictionary(elac)
+            print("Read OD", "OK" if ok else "FALLITO")
+            sys.exit(0 if ok else 3)
         elif test_type == "vel":
             if len(sys.argv) < 4:
                 print("Errore: servono 2 parametri numerici per 'vel'.")
