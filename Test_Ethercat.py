@@ -39,7 +39,7 @@ def main():
             finish("Read Object Dictionary", ok)
 
 
-        elif test_type == "pdoMapping":
+        elif test_type == "pdomapping":
             ok = run_sdo_comm_test(elac)
             finish("Read Object Dictionary", ok)
 
