@@ -41,4 +41,4 @@ def run_sdo_comm_test(elac):
 
     print(f"Mode of operation: {elac.sdo[0x6060].raw}")
 
-
+    return True

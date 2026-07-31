@@ -170,7 +170,10 @@ class RpPysoem:
             print(f"[{i}] SII name: {s.name}")
 
         # Map PDOs
-        #self.master.config_map()
+        print("#############################")
+        print("\n=== PDO mapping start ===")
+        print("#############################")
+        self.master.config_map()
         print("#############################")
         print("\n=== PDO mapping results ===")
         print("#############################")
