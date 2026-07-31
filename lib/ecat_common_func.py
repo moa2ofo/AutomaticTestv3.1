@@ -2,7 +2,7 @@ import time
 import pysoem
 import struct
 from .eth_wrapper import EtherCATNode
-ifname = r'\Device\NPF_{FA39BC94-2EDC-4827-9482-10BD0183CDFA}'
+ifname = r'\Device\NPF_{4CDA18E5-502B-482C-A272-78CDB45D4C0B}'
 #ifname = r'\Device\NPF_{8B8E55E1-1E21-450D-9E52-FEAF245CCC3A}'
 def dump_sii_mailbox(slave):
     print("\n--- SII Mailbox Info ---")
@@ -43,7 +43,7 @@ def dump_sii_mailbox(slave):
     
     print("Mailbox category (0x0A) not found in SII.")
 def dump_pdo_via_sdo(slave):
-    print(f"\n=== PDO MAP for {slave.name} ===")
+    print(f"\n--- DUMPING PDO via SDO ---\n=== PDO MAP for {slave.name} ===")
 
     # RX PDO
     for pdo_idx in range(0x1600, 0x1604):
@@ -170,7 +170,7 @@ class RpPysoem:
             print(f"[{i}] SII name: {s.name}")
 
         # Map PDOs
-        self.master.config_map()
+        #self.master.config_map()
         print("#############################")
         print("\n=== PDO mapping results ===")
         print("#############################")
