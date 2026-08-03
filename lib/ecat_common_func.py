@@ -1,347 +1,504 @@
-import time
-import pysoem
+"""EtherCAT master dedicato alla comunicazione CoE/SDO.
+
+Il mapping PDO viene comunque letto e configurato tramite ``config_map()``, ma
+l'applicazione non esegue uno scambio PDO ciclico e non porta automaticamente
+la rete in OP. Lo stato operativo predefinito e' SAFE-OP, nel quale il mailbox
+CoE/SDO resta disponibile e la configurazione PDO e' gia stata validata.
+"""
+
+from __future__ import annotations
+
 import struct
-from .eth_wrapper import EtherCATNode
-ifname = r'\Device\NPF_{FA39BC94-2EDC-4827-9482-10BD0183CDFA}'
-#ifname = r'\Device\NPF_{8B8E55E1-1E21-450D-9E52-FEAF245CCC3A}'
-def dump_sii_mailbox(slave):
-    print("\n--- SII Mailbox Info ---")
-
-    # L’offset della categoria è memorizzato nella tabella categorie
-    # Leggiamo i primi 64 byte della EEPROM dove c’è la Category Table
-    data = slave.eeprom_read(0x40, 64)
-
-    # Ogni entry: [CategoryID(16bit), Length(16bit)]
-    # Cerchiamo la categoria 0x000A (Mailbox)
-    for i in range(0, 64, 4):
-        cat = int.from_bytes(data[i:i+2], "little")
-        length = int.from_bytes(data[i+2:i+4], "little")
-
-        if cat == 0x000A:
-            offset = 0x40 + i + 4
-            size = length * 2  # lunghezza in WORD, converti in byte
-            raw = slave.eeprom_read(offset, size)
-
-            # Formato SII Mailbox (standard ETG2010):
-            # Word0 = MailboxOutStart
-            # Word1 = MailboxOutSize
-            # Word2 = MailboxInStart
-            # Word3 = MailboxInSize
-            # Word4 = SupportedProtocols
-            mo_start = int.from_bytes(raw[0:2], "little")
-            mo_size  = int.from_bytes(raw[2:4], "little")
-            mi_start = int.from_bytes(raw[4:6], "little")
-            mi_size  = int.from_bytes(raw[6:8], "little")
-            proto = int.from_bytes(raw[8:10], "little")
-
-            print(f"Mailbox-Out Start : 0x{mo_start:04X}")
-            print(f"Mailbox-Out Size  : {mo_size} bytes")
-            print(f"Mailbox-In Start  : 0x{mi_start:04X}")
-            print(f"Mailbox-In Size   : {mi_size} bytes")
-            print(f"Protocols (bitmask): 0x{proto:04X}")
-            return
-    
-    print("Mailbox category (0x0A) not found in SII.")
-def dump_pdo_via_sdo(slave):
-    print(f"\n=== PDO MAP for {slave.name} ===")
-
-    # RX PDO
-    for pdo_idx in range(0x1600, 0x1604):
-        try:
-            n = slave.sdo_read(pdo_idx, 0)[0]
-        except Exception:
-            continue
-
-        print(f"\nRxPDO 0x{pdo_idx:04X} ({n} entries):")
-        for si in range(1, n + 1):
-            raw = int.from_bytes(slave.sdo_read(pdo_idx, si), "little")
-            index = (raw >> 16) & 0xFFFF
-            subidx = (raw >> 8) & 0xFF
-            bitlen = raw & 0xFF
-            print(f"  - 0x{index:04X}:{subidx}  ({bitlen} bits)")
-
-    # TX PDO
-    for pdo_idx in range(0x1A00, 0x1A04):
-        try:
-            n = slave.sdo_read(pdo_idx, 0)[0]
-        except Exception:
-            continue
-
-        print(f"\nTxPDO 0x{pdo_idx:04X} ({n} entries):")
-        for si in range(1, n + 1):
-            raw = int.from_bytes(slave.sdo_read(pdo_idx, si), "little")
-            index = (raw >> 16) & 0xFFFF
-            subidx = (raw >> 8) & 0xFF
-            bitlen = raw & 0xFF
-            print(f"  - 0x{index:04X}:{subidx}  ({bitlen} bits))")
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, ClassVar
+import pysoem
 
 
-class RpPysoem:
-    def ethercat_debug(self):
-        master = self.master
-        print("\n========== EtherCAT DEBUG ==========")
-        
-        master.send_processdata()
-        wkc = master.receive_processdata(2000)
-        print("WKC:", wkc)
-
-        n = len(master.slaves)
-        print("Slaves len(master.slaves) =", n)
-        if n == 0:
-            print("❌ No slaves found!")
-            return False
-    
-        s = master.slaves[0]
-    
-        # Identity (SII)
-        print("\n--- Slave Identity (EEPROM/SII) ---")
-        print("Name       :", getattr(s, "name", "<no name>"))
-        print("Vendor ID  :", hex(getattr(s, "man", 0)))
-        print("Product ID :", hex(getattr(s, "id", 0)))
-        print("Revision   :", hex(getattr(s, "rev", 0)))
-    
-        if getattr(s, "man", 0) == 0xffffffff or getattr(s, "id", 0) == 0xffffffff:
-            print("\n❌ EEPROM/SII NOT READABLE → very likely EEPROM/wiring/WP/power/strap issue")
-            # prova anche a leggere lo stato/AL
-            master.read_state()
-            print("State:", hex(getattr(s, "state", 0)))
-            al = getattr(s, "al_status", getattr(s, "al_status_code", 0))
-            print("AL status code:", hex(al))
-            try:
-                print("AL text:", pysoem.al_status_code_to_string(al))
-            except Exception:
-                pass
-            return False
-    
-        # State / AL
-        print("\n--- State / AL ---")
-        master.read_state()
-        print("State:", hex(getattr(s, "state", 0)))
-        al = getattr(s, "al_status", getattr(s, "al_status_code", 0))
-        print("AL status code:", hex(al))
-        try:
-            print("AL text:", pysoem.al_status_code_to_string(al))
-        except Exception:
-            pass
-    
-        # WKC check (process data)
-        print("\n--- WKC Check ---")
-        master.send_processdata()
-        wkc = master.receive_processdata(2000)
-        print("WKC:", wkc)
-        if wkc == 0:
-            print("❌ WKC=0 → frames not returning reliably (PHY/magnetics/strap/reset)")
-            return False
-        
-        
-        
-        print("✅ Basic cyclic exchange seems alive.")
-        return True
+ETHERCAT_STATES = {
+    pysoem.INIT_STATE: "INIT",
+    pysoem.PREOP_STATE: "PRE-OP",
+    pysoem.SAFEOP_STATE: "SAFE-OP",
+    pysoem.OP_STATE: "OPERATIONAL",
+}
 
 
+DEFAULT_INTERFACE = r"\Device\NPF_{8B8E55E1-1E21-450D-9E52-FEAF245CCC3A}"
 
-    def __init__(self, interface_name=ifname):
-        print("Interface :", interface_name)
-        # Open interface
+
+@dataclass(frozen=True)
+class PdoEntry:
+    index: int
+    subindex: int
+    bit_length: int
+
+    @classmethod
+    def from_mapping_value(cls, value: int) -> "PdoEntry":
+        return cls(
+            index=(value >> 16) & 0xFFFF,
+            subindex=(value >> 8) & 0xFF,
+            bit_length=value & 0xFF,
+        )
+
+
+@dataclass(frozen=True)
+class PdoMapping:
+    direction: str
+    assignment_index: int
+    mapping_index: int
+    entries: tuple[PdoEntry, ...]
+
+
+class EthercatSdoMaster:
+    """Master EtherCAT per accessi SDO con mapping PDO abilitato."""
+
+    _ENCODERS: ClassVar[dict[str, Callable[[Any], bytes]]] = {
+        "BOOLEAN": lambda value: bytes((1 if value else 0,)),
+        "INTEGER8": lambda value: struct.pack("<b", value),
+        "INTEGER16": lambda value: struct.pack("<h", value),
+        "INTEGER32": lambda value: struct.pack("<i", value),
+        "INTEGER64": lambda value: struct.pack("<q", value),
+        "UNSIGNED8": lambda value: struct.pack("<B", value),
+        "UNSIGNED16": lambda value: struct.pack("<H", value),
+        "UNSIGNED32": lambda value: struct.pack("<I", value),
+        "UNSIGNED64": lambda value: struct.pack("<Q", value),
+        "REAL32": lambda value: struct.pack("<f", value),
+        "REAL64": lambda value: struct.pack("<d", value),
+        "VISIBLE_STRING": lambda value: str(value).encode("utf-8") + b"\x00",
+        "OCTET_STRING": bytes,
+    }
+
+    _DECODERS: ClassVar[dict[str, Callable[[bytes], Any]]] = {
+        "BOOLEAN": lambda data: bool(data[0]),
+        "INTEGER8": lambda data: struct.unpack("<b", data[:1])[0],
+        "INTEGER16": lambda data: struct.unpack("<h", data[:2])[0],
+        "INTEGER32": lambda data: struct.unpack("<i", data[:4])[0],
+        "INTEGER64": lambda data: struct.unpack("<q", data[:8])[0],
+        "UNSIGNED8": lambda data: struct.unpack("<B", data[:1])[0],
+        "UNSIGNED16": lambda data: struct.unpack("<H", data[:2])[0],
+        "UNSIGNED32": lambda data: struct.unpack("<I", data[:4])[0],
+        "UNSIGNED64": lambda data: struct.unpack("<Q", data[:8])[0],
+        "REAL32": lambda data: struct.unpack("<f", data[:4])[0],
+        "REAL64": lambda data: struct.unpack("<d", data[:8])[0],
+        "VISIBLE_STRING": lambda data: data.split(b"\x00", 1)[0].decode(
+            "utf-8", errors="replace"
+        ),
+        "OCTET_STRING": lambda data: data,
+    }
+
+    def __init__(
+        self,
+        interface_name: str = DEFAULT_INTERFACE,
+        *,
+        scan_attempts: int = 100,
+        scan_delay_s: float = 0.2,
+        state_timeout_us: int = 5_000_000,
+        map_pdos: bool = True,
+        request_safeop: bool = True,
+    ) -> None:
+        self.interface_name = interface_name
+        self.scan_attempts = scan_attempts
+        self.scan_delay_s = scan_delay_s
+        self.state_timeout_us = state_timeout_us
+        self.map_pdos = map_pdos
+        self.request_safeop = request_safeop
+
         self.master = pysoem.Master()
-        self.master.open(interface_name)
-        print("Interface opened:", interface_name)
+        self._is_open = False
+        self.io_map_size = 0
 
-        # Scan slaves
+    def connect(self) -> None:
+        """Apre l'interfaccia, trova gli slave e prepara il mapping PDO."""
+        if self._is_open:
+            return
 
+        try:
+            self.master.open(self.interface_name)
+            self._is_open = True
+            self._discover_slaves()
+            self._print_slave_identities()
 
-
-        max_attempts = 100  # opzionale
-        attempts = 0
-
-        while True:
-            if self.master.config_init() > 0:
-                break
-
-            attempts += 1
-            if attempts >= max_attempts:
-                raise RuntimeError("No slave found")
-
-            time.sleep(0.2)
+            self.configure_pdos()
 
 
-        print(f"Slaves found: {len(self.master.slaves)}")
-        for i, s in enumerate(self.master.slaves):
-            print(f"[{i}] SII name: {s.name}")
+            self.print_all_pdo_mappings()
+            self._request_state(pysoem.PREOP_STATE, "PRE-OP")
+        except Exception:
+            self.close()
+            raise
 
-        # Map PDOs
-        self.master.config_map()
-        print("#############################")
-        print("\n=== PDO mapping results ===")
-        print("#############################")
-        for i, s in enumerate(self.master.slaves):
-            print(f"\nSlave {i}: {s.name}")
-            print(len(s.input), len(s.output))
-            dump_pdo_via_sdo(s)
-            dump_sii_mailbox(s)
+    def configure_pdos(self) -> None:
+        print("\n========== PDO CONFIGURATION ==========")
 
+        try:
+            self.io_map_size = self.master.config_map()
 
+        except pysoem.ConfigMapError as exc:
+            print("[ERROR] config_map() failed")
 
+            errors = getattr(exc, "error_list", [])
 
+            if not errors:
+                print(f"[ERROR] {exc!r}")
 
+            for number, error in enumerate(errors, start=1):
+                print(f"[ERROR {number}] type={type(error).__name__}")
 
-        # SAFE-OP
+                for attribute in (
+                    "slave_pos",
+                    "index",
+                    "subindex",
+                    "abort_code",
+                    "error_code",
+                    "desc",
+                    "message",
+                ):
+                    if hasattr(error, attribute):
+                        value = getattr(error, attribute)
+
+                        if attribute in {
+                            "index",
+                            "abort_code",
+                            "error_code",
+                        } and isinstance(value, int):
+                            value = f"0x{value:08X}"
+
+                        print(f"    {attribute}: {value}")
+
+            raise
+
+        print(f"[INFO] IO map size: {self.io_map_size} byte")
+
+        for index, slave in enumerate(self.master.slaves):
+            print(
+                f"[{index}] {slave.name}: "
+                f"output/RxPDO={len(slave.output)} byte, "
+                f"input/TxPDO={len(slave.input)} byte"
+            )
+
+        if self.io_map_size == 0:
+            raise RuntimeError(
+                "config_map() completed but generated an empty IO map."
+            )
+
+    def print_ethercat_state(self) -> None:
+        self.master.read_state()
+
+        for index, slave in enumerate(self.master.slaves):
+            raw_state = slave.state
+            base_state = raw_state & 0x0F
+            has_error = bool(raw_state & pysoem.STATE_ERROR)
+
+            state_name = ETHERCAT_STATES.get(
+                base_state,
+                f"UNKNOWN 0x{base_state:02X}",
+            )
+
+            al_status = getattr(slave, "al_status", 0)
+
+            try:
+                al_text = pysoem.al_status_code_to_string(al_status)
+            except Exception:
+                al_text = "Unknown AL status"
+
+            print(
+                f"[{index}] {slave.name}: "
+                f"state={state_name}, "
+                f"raw=0x{raw_state:02X}, "
+                f"error={has_error}, "
+                f"AL=0x{al_status:04X} ({al_text})"
+            )
+
+    def close(self) -> None:
+        """Riporta la rete in INIT e chiude l'interfaccia."""
+        if not self._is_open:
+            return
+
+        try:
+            self.master.state = pysoem.INIT_STATE
+            self.master.write_state()
+        finally:
+            self.master.close()
+            self._is_open = False
+
+    def __enter__(self) -> "EthercatSdoMaster":
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+    def _discover_slaves(self) -> None:
+        for attempt in range(1, self.scan_attempts + 1):
+            slave_count = self.master.config_init()
+            if slave_count > 0:
+                print(f"Slave trovati: {slave_count}")
+                return
+
+            if attempt < self.scan_attempts:
+                time.sleep(self.scan_delay_s)
+
+        raise RuntimeError(
+            f"Nessuno slave trovato dopo {self.scan_attempts} tentativi "
+            f"sull'interfaccia {self.interface_name!r}"
+        )
+
+    def _print_slave_identities(self) -> None:
+        for position, slave in enumerate(self.master.slaves):
+            print(
+                f"[{position}] {slave.name} | vendor=0x{slave.man:08X} "
+                f"product=0x{slave.id:08X} revision=0x{slave.rev:08X}"
+            )
+
+    def _request_state(self, state: int, label: str) -> None:
+        self.master.state = state
+        self.master.write_state()
+        reached = self.master.state_check(state, self.state_timeout_us)
+        if reached != state:
+            self._raise_state_error(label)
+        print(f"Master in {label}")
+
+    def _enter_safeop(self) -> None:
+        """Entra in SAFE-OP senza avviare un ciclo PDO continuo."""
         self.master.state = pysoem.SAFEOP_STATE
         self.master.write_state()
-        self.master.state_check(pysoem.SAFEOP_STATE, 5000)
-        print("Master in SAFE-OP")
 
-        # Wrap first slave with your EtherCATNode
-        self.node = EtherCATNode(self.master, self.master.slaves[0])
+        # Un breve scambio di process data puo' essere necessario per completare
+        # la transizione dopo config_map(). Non viene mantenuto alcun ciclo PDO.
+        if self.map_pdos:
+            for _ in range(10):
+                self.master.send_processdata()
+                self.master.receive_processdata(2_000)
+                if (
+                    self.master.state_check(pysoem.SAFEOP_STATE, 50_000)
+                    == pysoem.SAFEOP_STATE
+                ):
+                    break
 
-        # Check fault via wrapper
-        try:
-            sw_bytes = self.node.sdo.upload(0x6041, 0)  # Statusword			
-            sw = int.from_bytes(sw_bytes, byteorder='little')
-            print(f"Statusword = 0x{sw:04X}")
-            if sw & 0x08:  # Fault bit
-                print("Fault detected, sending Fault Reset")
-                self.s60.sdo["Controlword"].raw = 0x80
-                time.sleep(0.1)
-        except Exception as e:
-            print(f"Could not read Statusword: {e}")
-       
+        reached = self.master.state_check(
+            pysoem.SAFEOP_STATE, self.state_timeout_us
+        )
+        if reached != pysoem.SAFEOP_STATE:
+            self._raise_state_error("SAFE-OP")
+        print("Master in SAFE-OP; comunicazione applicativa solo via SDO")
 
-        # Go to OPERATIONAL
-        self.master.state = pysoem.OP_STATE
-        self.master.write_state()
-        self.master.state_check(pysoem.OP_STATE, 5000)
-        print("Master in OP")
-
-        # Read back state safely
-        for i, s in enumerate(self.master.slaves):
-            print(f"[{i}] state={s.state & 0xFF}")  # masked AL state only
-
-    # -------------------------------------------------------------------------
-    # CoE data encoding / decoding helpers
-    # -------------------------------------------------------------------------
-
-
-    def encode_value(self, value, data_type):
-        """Encode Python value into EtherCAT-compatible bytes."""
-        type_map = {
-            'BOOLEAN': lambda v: bytes([1 if v else 0]),
-            'INTEGER8': lambda v: struct.pack('<b', v),
-            'INTEGER16': lambda v: struct.pack('<h', v),
-            'INTEGER32': lambda v: struct.pack('<i', v),
-            'INTEGER64': lambda v: struct.pack('<q', v),
-            'UNSIGNED8': lambda v: struct.pack('<B', v),
-            'UNSIGNED16': lambda v: struct.pack('<H', v),
-            'UNSIGNED32': lambda v: struct.pack('<I', v),
-            'UNSIGNED64': lambda v: struct.pack('<Q', v),
-            'REAL32': lambda v: struct.pack('<f', v),
-            'REAL64': lambda v: struct.pack('<d', v),
-            'VISIBLE_STRING': lambda v: v.encode('utf-8') + b'\x00',
-            'OCTET_STRING': lambda v: bytes(v),
-        }
-
-        if data_type not in type_map:
-            raise ValueError(f"Unsupported CoE data type: {data_type}")
-
-        return type_map[data_type](value)
-
-    def decode_value(self, data, data_type):
-        """Decode EtherCAT bytes into Python value."""
-        type_map = {
-            'BOOLEAN': lambda d: bool(d[0]),
-            'INTEGER8': lambda d: struct.unpack('<b', d[:1])[0],
-            'INTEGER16': lambda d: struct.unpack('<h', d[:2])[0],
-            'INTEGER32': lambda d: struct.unpack('<i', d[:4])[0],
-            'INTEGER64': lambda d: struct.unpack('<q', d[:8])[0],
-            'UNSIGNED8': lambda d: struct.unpack('<B', d[:1])[0],
-            'UNSIGNED16': lambda d: struct.unpack('<H', d[:2])[0],
-            'UNSIGNED32': lambda d: struct.unpack('<I', d[:4])[0],
-            'UNSIGNED64': lambda d: struct.unpack('<Q', d[:8])[0],
-            'REAL32': lambda d: struct.unpack('<f', d[:4])[0],
-            'REAL64': lambda d: struct.unpack('<d', d[:8])[0],
-            'VISIBLE_STRING': lambda d: d.split(b'\x00', 1)[0].decode('utf-8', errors='ignore'),
-            'OCTET_STRING': lambda d: d,
-        }
-
-        if data_type not in type_map:
-            raise ValueError(f"Unsupported CoE data type: {data_type}")
-
-        return type_map[data_type](data)
-
-    def go_to_op_state(self, timeout_ms=5000):
-        """
-        Bring all EtherCAT slaves to OPERATIONAL state.
-        Performs process data mapping, DC config (if supported),
-        and verifies all slaves reach OP.
-        """
-        print("\n[INFO] Transitioning all slaves to OPERATIONAL (OP) state...")
-
-        # Configure PDO mapping and DC synchronization (standard sequence)
-        self.master.config_map()
-        # self.master.config_dc()
-
-        # Request OP state
-        self.master.state = pysoem.OP_STATE
-        self.master.write_state()
-
-        # Wait until all slaves reach OP or timeout
-        if self.master.state_check(pysoem.OP_STATE, timeout_ms) != pysoem.OP_STATE:
-            print("[WARN] Not all slaves reached OP within timeout.")
-            self.master.read_state()
-            for i, s in enumerate(self.master.slaves):
-                print(f"[{i}] {s.name} → state={s.state}, AL status=0x{s.al_status_code:04X}")
-            raise RuntimeError("Some slaves failed to reach OP state")
-
-        print("[OK] All slaves are now in OPERATIONAL state.")
+    def _raise_state_error(self, requested_label: str) -> None:
         self.master.read_state()
-        for i, s in enumerate(self.master.slaves):
-            print(f"[{i}] {s.name} → state={s.state} (4=OP)")
+        details: list[str] = []
+        for position, slave in enumerate(self.master.slaves):
+            al_status = getattr(slave, "al_status", 0)
+            try:
+                al_text = pysoem.al_status_code_to_string(al_status)
+            except Exception:
+                al_text = "stato AL non disponibile"
+            details.append(
+                f"slave {position} ({slave.name}): state=0x{slave.state:02X}, "
+                f"AL=0x{al_status:04X} ({al_text})"
+            )
+        raise RuntimeError(
+            f"Impossibile raggiungere {requested_label}. " + "; ".join(details)
+        )
 
-    # -------------------------------------------------------------------------
-    # Example usage: read/write an SDO with automatic encoding/decoding
-    # -------------------------------------------------------------------------
+    def _slave(self, slave_index: int):
+        if not self._is_open:
+            raise RuntimeError("Master non connesso")
+        try:
+            return self.master.slaves[slave_index]
+        except IndexError as exc:
+            raise IndexError(f"Indice slave non valido: {slave_index}") from exc
 
-    def read_sdo(self, slave_index, index, subindex, data_type="UNSIGNED32"):
-        """Read an SDO and decode it automatically."""
-        slave = self.master.slaves[slave_index]
-        data = slave.sdo_read(index, subindex)      
-        print("RAW SDO DATA:", data)
-        print("HEX:", data.hex())
-        return self.decode_value(data, data_type)
+    @staticmethod
+    def _read_u8(slave: Any, index: int, subindex: int) -> int:
+        data = slave.sdo_read(index, subindex)
+        if not data:
+            raise ValueError(f"Oggetto 0x{index:04X}:{subindex:02X} vuoto")
+        return data[0]
 
-    def write_sdo(self, slave_index, index, subindex, value, data_type="UNSIGNED32"):
-        """Encode and write an SDO."""
-        slave = self.master.slaves[slave_index]
-        encoded = self.encode_value(value, data_type)
-        slave.sdo_write(index, subindex, encoded)
-        print(f"Wrote {value} ({data_type}) to 0x{index:04X}:{subindex}")
+    @staticmethod
+    def _read_u16(slave: Any, index: int, subindex: int) -> int:
+        data = slave.sdo_read(index, subindex)
+        return int.from_bytes(data, "little", signed=False)
+
+    def read_pdo_mappings(self, slave_index: int) -> tuple[PdoMapping, ...]:
+        """Legge i PDO assegnati tramite 0x1C12 e 0x1C13 usando SDO."""
+        slave = self._slave(slave_index)
+        mappings: list[PdoMapping] = []
+
+        assignments = (
+            ("RxPDO", 0x1C12),
+            ("TxPDO", 0x1C13),
+        )
+
+        for direction, assignment_index in assignments:
+            try:
+                assigned_count = self._read_u8(slave, assignment_index, 0)
+            except pysoem.SdoError:
+                continue
+
+            for assignment_subindex in range(1, assigned_count + 1):
+                mapping_index = self._read_u16(
+                    slave, assignment_index, assignment_subindex
+                )
+                if mapping_index == 0:
+                    continue
+
+                entry_count = self._read_u8(slave, mapping_index, 0)
+                entries = tuple(
+                    PdoEntry.from_mapping_value(
+                        int.from_bytes(
+                            slave.sdo_read(mapping_index, entry_subindex),
+                            "little",
+                            signed=False,
+                        )
+                    )
+                    for entry_subindex in range(1, entry_count + 1)
+                )
+                mappings.append(
+                    PdoMapping(
+                        direction=direction,
+                        assignment_index=assignment_index,
+                        mapping_index=mapping_index,
+                        entries=entries,
+                    )
+                )
+
+        return tuple(mappings)
+
+    def print_pdo_mapping(self, slave_index: int) -> None:
+        slave = self._slave(slave_index)
+        print(f"\n=== PDO map slave {slave_index}: {slave.name} ===")
+
+        try:
+            mappings = self.read_pdo_mappings(slave_index)
+        except pysoem.SdoError as exc:
+            print(f"Lettura mapping PDO fallita: {exc}")
+            return
+
+        if not mappings:
+            print("Nessun PDO assegnato tramite 0x1C12/0x1C13")
+            return
+
+        for mapping in mappings:
+            total_bits = sum(entry.bit_length for entry in mapping.entries)
+            print(
+                f"{mapping.direction} 0x{mapping.mapping_index:04X} "
+                f"({len(mapping.entries)} entry, {total_bits} bit)"
+            )
+            for entry in mapping.entries:
+                print(
+                    f"  - 0x{entry.index:04X}:{entry.subindex:02X} "
+                    f"({entry.bit_length} bit)"
+                )
+
+    def print_all_pdo_mappings(self) -> None:
+        for slave_index in range(len(self.master.slaves)):
+            self.print_pdo_mapping(slave_index)
+
+    @classmethod
+    def encode_value(cls, value: Any, data_type: str) -> bytes:
+        normalized_type = data_type.upper()
+        try:
+            return cls._ENCODERS[normalized_type](value)
+        except KeyError as exc:
+            raise ValueError(f"Tipo CoE non supportato: {data_type}") from exc
+        except (TypeError, ValueError, struct.error) as exc:
+            raise ValueError(
+                f"Valore {value!r} non valido per {normalized_type}"
+            ) from exc
+
+    @classmethod
+    def decode_value(cls, data: bytes, data_type: str) -> Any:
+        normalized_type = data_type.upper()
+        try:
+            decoder = cls._DECODERS[normalized_type]
+        except KeyError as exc:
+            raise ValueError(f"Tipo CoE non supportato: {data_type}") from exc
+
+        try:
+            return decoder(data)
+        except (IndexError, struct.error) as exc:
+            raise ValueError(
+                f"Dimensione dati non valida per {normalized_type}: {len(data)} byte"
+            ) from exc
+
+    def read_sdo(
+        self,
+        slave_index: int,
+        index: int,
+        subindex: int = 0,
+        data_type: str = "UNSIGNED32",
+        *,
+        complete_access: bool = False,
+    ) -> Any:
+        slave = self._slave(slave_index)
+        raw = slave.sdo_read(index, subindex, ca=complete_access)
+        value = self.decode_value(raw, data_type)
+        print(
+            f"SDO read slave={slave_index} 0x{index:04X}:{subindex:02X} "
+            f"raw={raw.hex()} value={value!r}"
+        )
+        return value
+
+    def write_sdo(
+        self,
+        slave_index: int,
+        index: int,
+        subindex: int,
+        value: Any,
+        data_type: str = "UNSIGNED32",
+        *,
+        complete_access: bool = False,
+    ) -> None:
+        slave = self._slave(slave_index)
+        raw = self.encode_value(value, data_type)
+        slave.sdo_write(index, subindex, raw, ca=complete_access)
+        print(
+            f"SDO write slave={slave_index} 0x{index:04X}:{subindex:02X} "
+            f"raw={raw.hex()} value={value!r}"
+        )
+
+    def reset_cia402_fault(self, slave_index: int = 0) -> bool:
+        """Esegue il fault reset CiA 402 tramite soli SDO."""
+        statusword = self.read_sdo(
+            slave_index, 0x6041, 0, "UNSIGNED16"
+        )
+        if not statusword & 0x0008:
+            print("Nessun fault CiA 402 attivo")
+            return False
+
+        self.write_sdo(slave_index, 0x6040, 0, 0x0080, "UNSIGNED16")
+        time.sleep(0.1)
+        self.write_sdo(slave_index, 0x6040, 0, 0x0000, "UNSIGNED16")
+        print("Fault reset CiA 402 inviato via SDO")
+        return True
+
+    def print_diagnostics(self) -> None:
+        self.master.read_state()
+        print("\n========== EtherCAT diagnostics ==========")
+        for position, slave in enumerate(self.master.slaves):
+            al_status = getattr(slave, "al_status", 0)
+            try:
+                al_text = pysoem.al_status_code_to_string(al_status)
+            except Exception:
+                al_text = "n/a"
+            print(
+                f"[{position}] {slave.name}: state=0x{slave.state:02X}, "
+                f"AL=0x{al_status:04X} ({al_text}), "
+                f"input={len(slave.input)} byte, output={len(slave.output)} byte"
+            )
+
+
+def main() -> None:
+    with EthercatSdoMaster(DEFAULT_INTERFACE) as ethercat:
+        ethercat.print_diagnostics()
+
+        # Esempi SDO; adattare gli oggetti al proprio slave.
+        statusword = ethercat.read_sdo(0, 0x6041, 0, "UNSIGNED16")
+        print(f"Statusword: 0x{statusword:04X}")
+
+        # Abilitare solo se il dispositivo implementa CiA 402.
+        # ethercat.reset_cia402_fault(0)
 
 
 if __name__ == "__main__":
-    rpsoem = RpPysoem()
-
-
-    m = pysoem.Master()
-    m.open(r'\Device\NPF_{7F89FC30-3BA0-4D0F-816C-A87E5B58D585}')
-    if m.config_init() <= 0:
-        raise RuntimeError("no slaves")
-    print("slaves:", len(m.slaves))
-
-    # Request SAFE-OP and pump PD *before* state_check
-    m.state = pysoem.SAFEOP_STATE
-    m.write_state()
-    for _ in range(600):
-        m.send_processdata()
-        m.receive_processdata(1000)
-    ok = (m.state_check(pysoem.SAFEOP_STATE, 8000) == pysoem.SAFEOP_STATE)
-    print("SAFE-OP ok?", ok)
-    m.read_state()
-    for i, s in enumerate(m.slaves):
-        print(i, s.name, "state=", s.state, "AL=", hex(getattr(s, 'al_status', 0)))
-        print('al status code {} ({})'.format(hex(s.al_status),
-                                              pysoem.al_status_code_to_string(s.al_status)))
-    m.close()
-
-
-
-
+    main()

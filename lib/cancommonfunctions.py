@@ -282,34 +282,137 @@ def read_faults_via_sdo(node, max_error_history=20, retries=3, delay_s=0.05):
     print("=========================================\n")
     return diag
 
-def QuitFromFaultCondition(node, deadline_s=1.0):
-	"""
-	Reset node faults with a deadline.
+import time
+import pysoem
 
-		Resets node faults with a deadline, by setting the CW fr bit to 1,
-		and then setting it to 0. If the node is in fault, prints an error message.
+def check_ethercat_ready(master):
+    master.read_state()
 
-		Args:
-			node (Node): CANopen node object.
-			deadline_s (float): The deadline in seconds.
+    print(f"Slaves found: {len(master.slaves)}")
+    print(f"Expected WKC: {master.expected_wkc}")
 
-		"""
-	start_time=time.perf_counter()
-	while(True):
-		if (time.perf_counter()-start_time)>deadline_s:
-			print(f'Error, reset fault deadline reached. Node {node} could be in fault.')
-			break
-		if(node.sdo[0x6041].raw & 8):		#MF: if node is in fault (Reading SW)
-			print(f'Node {node.id} is in fault.')
-			if (node.sdo[0x6040].raw & 0x80) == 0:	#MF: if CW fr bit is zero
-				#time.sleep(0.05)
-				node.sdo[0x6040].raw = 0x80
-			else:
-				node.sdo[0x6040].raw = 0
-		else:
-			print(f'Node {node.id} faults erased.')
-			break
-		#time.sleep(0.05)
+    if not master.slaves:
+        raise RuntimeError("No EtherCAT slaves available")
+
+    for index, slave in enumerate(master.slaves):
+        al_description = pysoem.al_status_code_to_string(slave.al_status)
+
+        print(
+            f"Slave {index}: "
+            f"name='{slave.name}', "
+            f"state=0x{slave.state:02X}, "
+            f"AL status=0x{slave.al_status:04X}, "
+            f"AL description='{al_description}'"
+        )
+
+        if slave.state == pysoem.INIT_STATE:
+            raise RuntimeError(
+                f"Slave {index} is still in INIT; "
+                "CoE mailbox access is not ready"
+            )
+
+def QuitFromFaultCondition(node, deadline_s=1.0, retry_delay_s=0.05):
+    """
+    Cancella la condizione di fault di un nodo CiA 402.
+
+    La funzione:
+    - legge lo Statusword 0x6041;
+    - verifica il bit Fault, bit 3;
+    - genera un impulso sul bit Fault Reset del Controlword 0x6040, bit 7;
+    - attende che il fault venga cancellato;
+    - interrompe l'operazione allo scadere della deadline.
+
+    Args:
+        node: oggetto nodo che espone node.sdo[index].raw.
+        deadline_s: tempo massimo, in secondi, per cancellare il fault.
+        retry_delay_s: pausa tra i tentativi SDO.
+
+    Returns:
+        bool:
+            True se il nodo non è in fault o il fault è stato cancellato.
+            False se la deadline viene superata o si verifica un errore
+            di comunicazione.
+    """
+
+    STATUSWORD_INDEX = 0x6041
+    CONTROLWORD_INDEX = 0x6040
+
+    STATUSWORD_FAULT_MASK = 0x0008
+    CONTROLWORD_FAULT_RESET_MASK = 0x0080
+
+    node_id = getattr(node, "id", "?")
+    start_time = time.perf_counter()
+    fault_reported = False
+
+    while time.perf_counter() - start_time <= deadline_s:
+        try:
+            # Lettura dello Statusword 0x6041:00.
+            statusword = node.sdo[STATUSWORD_INDEX].raw
+
+            # Bit 3 dello Statusword: Fault.
+            if (statusword & STATUSWORD_FAULT_MASK) == 0:
+                if fault_reported:
+                    print(f"Node {node_id} faults erased.")
+                else:
+                    print(f"Node {node_id} is not in fault.")
+
+                return True
+
+            if not fault_reported:
+                print(
+                    f"Node {node_id} is in fault. "
+                    f"Statusword: 0x{statusword:04X}"
+                )
+                fault_reported = True
+
+            # Conserva gli altri bit del Controlword.
+            controlword = node.sdo[CONTROLWORD_INDEX].raw
+
+            # Fronte di salita sul bit Fault Reset.
+            node.sdo[CONTROLWORD_INDEX].raw = (
+                controlword | CONTROLWORD_FAULT_RESET_MASK
+            )
+
+            time.sleep(retry_delay_s)
+
+            # Riporta a zero solamente il bit Fault Reset.
+            node.sdo[CONTROLWORD_INDEX].raw = (
+                controlword & ~CONTROLWORD_FAULT_RESET_MASK
+            )
+
+            time.sleep(retry_delay_s)
+
+        except pysoem.WkcError as exc:
+            print(
+                f"EtherCAT WKC error while resetting node {node_id}: {exc}"
+            )
+            return False
+
+        except pysoem.SdoError as exc:
+            print(
+                f"SDO error while accessing 0x6040/0x6041 "
+                f"on node {node_id}: {exc}"
+            )
+            return False
+
+        except pysoem.MailboxError as exc:
+            print(
+                f"Mailbox error while resetting node {node_id}: {exc}"
+            )
+            return False
+
+        except (AttributeError, TypeError, ValueError) as exc:
+            print(
+                f"Invalid node or SDO value for node {node_id}: {exc}"
+            )
+            return False
+
+    print(
+        f"Error, reset fault deadline reached. "
+        f"Node {node_id} could still be in fault."
+    )
+
+    return False
 
 def PrintSW(node):
 	print(f'Node {node.id} Statusword is:', hex(node.sdo['Statusword'].raw))
