@@ -118,11 +118,18 @@ class EthercatSdoMaster:
             self._discover_slaves()
             self._print_slave_identities()
 
-            self.configure_pdos()
+
+
 
 
             self.print_all_pdo_mappings()
             self._request_state(pysoem.PREOP_STATE, "PRE-OP")
+            if self.map_pdos:
+                self.configure_pdos()
+                print("self.configure_pdos()")
+            if self.request_safeop:
+                print("self._enter_safeop()")
+                self._enter_safeop()
         except Exception:
             self.close()
             raise

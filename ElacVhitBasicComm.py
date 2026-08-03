@@ -194,8 +194,8 @@ def initialize_ethercat(
 
     ethercat = EthercatSdoMaster(
         interface_name,
-        map_pdos=False,
-        request_safeop=False,
+        map_pdos=True,
+        request_safeop=True,
     )
 
     try:
