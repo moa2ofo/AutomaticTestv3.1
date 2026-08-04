@@ -115,25 +115,62 @@ class EthercatSdoMaster:
         try:
             self.master.open(self.interface_name)
             self._is_open = True
+
             self._discover_slaves()
             self._print_slave_identities()
 
-
-
-
+            # config_init() ha ora popolato master.slaves e i CoE details.
+            # Forziamo SOEM a usare letture SDO singole durante config_map().
+            self.disable_complete_access_for_config_map()
 
             self.print_all_pdo_mappings()
             self._request_state(pysoem.PREOP_STATE, "PRE-OP")
+
             if self.map_pdos:
+                self.dump_pdo_configuration(
+                    slave_index=0,
+                    include_candidate_maps=True,
+                )
+
                 self.configure_pdos()
                 print("self.configure_pdos()")
+
             if self.request_safeop:
                 print("self._enter_safeop()")
                 self._enter_safeop()
+
         except Exception:
             self.close()
             raise
+    def disable_complete_access_for_config_map(self) -> None:
+        """
+        Impedisce a SOEM di usare letture SDO Complete Access durante
+        config_map().
 
+        Utile per slave che dichiarano Complete Access nella SII, ma che
+        restituiscono risposte CA non compatibili con SOEM.
+        """
+
+        print("\n========== DISABLE COMPLETE ACCESS ==========")
+
+        for position, slave in enumerate(self.master.slaves):
+            disable_ca = getattr(slave, "_disable_complete_access", None)
+
+            if disable_ca is None:
+                raise RuntimeError(
+                    "Questa versione di PySOEM non espone "
+                    "CdefSlave._disable_complete_access(). "
+                    "È richiesta PySOEM >= 1.1.3."
+                )
+
+            disable_ca()
+
+            print(
+                f"[INFO] Slave {position} ({slave.name}): "
+                "Complete Access disabilitato per config_map()"
+            )
+
+        print("=============================================\n")
     def configure_pdos(self) -> None:
         print("\n========== PDO CONFIGURATION ==========")
 
@@ -187,6 +224,495 @@ class EthercatSdoMaster:
             raise RuntimeError(
                 "config_map() completed but generated an empty IO map."
             )
+    def dump_pdo_configuration(
+    self,
+    slave_index: int = 0,
+    *,
+    include_candidate_maps: bool = True,
+) -> None:
+        """
+        Esegue un dump diagnostico della configurazione PDO EtherCAT.
+
+        Deve essere chiamata in PRE-OP, dopo config_init() e prima di config_map().
+
+        Legge:
+        - 0x1C00: Sync Manager Communication Type;
+        - 0x1C12: RxPDO assignment;
+        - 0x1C13: TxPDO assignment;
+        - tutti i mapping PDO assegnati;
+        - opzionalmente 0x1600..0x1602 e 0x1A00..0x1A02;
+        - informazioni PySOEM disponibili sullo slave;
+        - lunghezze raw di ogni risposta SDO.
+
+        Non modifica alcun oggetto dello slave.
+        """
+
+        if not self._is_open:
+            raise RuntimeError("Master EtherCAT non connesso")
+
+        if not 0 <= slave_index < len(self.master.slaves):
+            raise IndexError(
+                f"Slave index {slave_index} non valido; "
+                f"slave disponibili: {len(self.master.slaves)}"
+            )
+
+        slave = self.master.slaves[slave_index]
+
+        def read_raw(index: int, subindex: int) -> bytes | None:
+            """
+            Legge un oggetto SDO e stampa dimensione, byte raw e valore intero.
+            Restituisce None se la lettura fallisce.
+            """
+            try:
+                raw = slave.sdo_read(index, subindex)
+
+                if not isinstance(raw, bytes):
+                    raw = bytes(raw)
+
+                value = int.from_bytes(raw, "little", signed=False)
+
+                print(
+                    f"  0x{index:04X}:{subindex:02X} "
+                    f"len={len(raw):2d} "
+                    f"raw={raw.hex(' '):<23} "
+                    f"value=0x{value:X}"
+                )
+
+                return raw
+
+            except pysoem.SdoError as exc:
+                print(
+                    f"  0x{index:04X}:{subindex:02X} "
+                    f"SDO ERROR: {exc}"
+                )
+                return None
+
+            except pysoem.MailboxError as exc:
+                print(
+                    f"  0x{index:04X}:{subindex:02X} "
+                    f"MAILBOX ERROR: {exc}"
+                )
+                return None
+
+            except pysoem.WkcError as exc:
+                print(
+                    f"  0x{index:04X}:{subindex:02X} "
+                    f"WKC ERROR: {exc}"
+                )
+                return None
+
+            except Exception as exc:
+                print(
+                    f"  0x{index:04X}:{subindex:02X} "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return None
+
+        def check_size(
+            index: int,
+            subindex: int,
+            raw: bytes | None,
+            expected_size: int,
+            type_name: str,
+        ) -> bool:
+            """
+            Verifica che la risposta SDO abbia la dimensione prevista.
+            """
+            if raw is None:
+                return False
+
+            if len(raw) == expected_size:
+                print(
+                    f"    [OK] {type_name}: "
+                    f"{expected_size} byte"
+                )
+                return True
+
+            print(
+                f"    [ERROR] 0x{index:04X}:{subindex:02X}: "
+                f"atteso {type_name} da {expected_size} byte, "
+                f"ricevuti {len(raw)} byte"
+            )
+            return False
+
+        def dump_assignment(
+            assignment_index: int,
+            direction: str,
+        ) -> list[int]:
+            """
+            Legge 0x1C12 o 0x1C13 e restituisce gli indici PDO assegnati.
+            """
+            print(
+                f"\n--- {direction} assignment "
+                f"0x{assignment_index:04X} ---"
+            )
+
+            assigned_pdos: list[int] = []
+
+            raw_count = read_raw(assignment_index, 0)
+            check_size(
+                assignment_index,
+                0,
+                raw_count,
+                1,
+                "UNSIGNED8",
+            )
+
+            if raw_count is None:
+                return assigned_pdos
+
+            assigned_count = int.from_bytes(
+                raw_count,
+                "little",
+                signed=False,
+            )
+
+            print(f"    PDO assegnati dichiarati: {assigned_count}")
+
+            if assigned_count > 32:
+                print(
+                    f"    [ERROR] Numero PDO non plausibile: "
+                    f"{assigned_count}"
+                )
+                return assigned_pdos
+
+            for subindex in range(1, assigned_count + 1):
+                raw = read_raw(assignment_index, subindex)
+
+                size_ok = check_size(
+                    assignment_index,
+                    subindex,
+                    raw,
+                    2,
+                    "UNSIGNED16",
+                )
+
+                if raw is None:
+                    continue
+
+                pdo_index = int.from_bytes(
+                    raw,
+                    "little",
+                    signed=False,
+                )
+
+                assigned_pdos.append(pdo_index)
+
+                if not size_ok:
+                    print(
+                        f"    [SUSPECT] Assignment 0x{pdo_index:04X} "
+                        "restituito con dimensione errata"
+                    )
+
+                if not (
+                    0x1600 <= pdo_index <= 0x17FF
+                    or 0x1A00 <= pdo_index <= 0x1BFF
+                ):
+                    print(
+                        f"    [WARN] Indice PDO non standard: "
+                        f"0x{pdo_index:04X}"
+                    )
+
+            return assigned_pdos
+
+        def dump_mapping(
+            mapping_index: int,
+            direction: str,
+        ) -> tuple[int, int]:
+            """
+            Legge un mapping PDO.
+
+            Returns:
+                tuple:
+                    numero di entry valide;
+                    numero totale di bit dichiarati.
+            """
+            print(
+                f"\n--- {direction} mapping "
+                f"0x{mapping_index:04X} ---"
+            )
+
+            raw_count = read_raw(mapping_index, 0)
+            check_size(
+                mapping_index,
+                0,
+                raw_count,
+                1,
+                "UNSIGNED8",
+            )
+
+            if raw_count is None:
+                return 0, 0
+
+            entry_count = int.from_bytes(
+                raw_count,
+                "little",
+                signed=False,
+            )
+
+            print(f"    Mapping entry dichiarate: {entry_count}")
+
+            if entry_count > 64:
+                print(
+                    f"    [ERROR] Numero mapping entry non plausibile: "
+                    f"{entry_count}"
+                )
+                return entry_count, 0
+
+            total_bits = 0
+
+            for subindex in range(1, entry_count + 1):
+                raw = read_raw(mapping_index, subindex)
+
+                size_ok = check_size(
+                    mapping_index,
+                    subindex,
+                    raw,
+                    4,
+                    "UNSIGNED32",
+                )
+
+                if raw is None:
+                    continue
+
+                mapping_value = int.from_bytes(
+                    raw,
+                    "little",
+                    signed=False,
+                )
+
+                object_index = (mapping_value >> 16) & 0xFFFF
+                object_subindex = (mapping_value >> 8) & 0xFF
+                bit_length = mapping_value & 0xFF
+
+                total_bits += bit_length
+
+                print(
+                    f"    -> 0x{object_index:04X}:"
+                    f"{object_subindex:02X}, "
+                    f"{bit_length} bit"
+                )
+
+                if not size_ok:
+                    print(
+                        "       [SUSPECT] Mapping entry trasferita "
+                        "con dimensione diversa da 32 bit"
+                    )
+
+                if bit_length == 0:
+                    print(
+                        "       [ERROR] Mapping entry con lunghezza zero"
+                    )
+
+                if object_index == 0:
+                    print(
+                        f"       [INFO] Padding PDO di "
+                        f"{bit_length} bit"
+                    )
+
+            total_bytes = (total_bits + 7) // 8
+
+            print(
+                f"    Totale: {total_bits} bit, "
+                f"{total_bytes} byte"
+            )
+
+            if total_bits % 8:
+                print(
+                    "    [WARN] Il PDO non termina su un confine "
+                    "di byte"
+                )
+
+            return entry_count, total_bits
+
+        print("\n")
+        print("=" * 72)
+        print("ETHER​CAT PDO DIAGNOSTIC DUMP")
+        print("=" * 72)
+
+        print("\n--- Slave identity ---")
+        print(f"Slave index:        {slave_index}")
+        print(f"Name:               {slave.name}")
+        print(f"Vendor ID:          0x{slave.man:08X}")
+        print(f"Product code:       0x{slave.id:08X}")
+        print(f"Revision:           0x{slave.rev:08X}")
+        print(f"State raw:          0x{slave.state:02X}")
+        print(f"AL status:          0x{slave.al_status:04X}")
+
+        try:
+            al_text = pysoem.al_status_code_to_string(slave.al_status)
+        except Exception:
+            al_text = "n/a"
+
+        print(f"AL description:     {al_text}")
+
+        print("\n--- PySOEM process-data information before config_map ---")
+
+        for attribute in (
+            "obits",
+            "ibits",
+            "obytes",
+            "ibytes",
+            "output",
+            "input",
+        ):
+            try:
+                value = getattr(slave, attribute)
+
+                if isinstance(value, bytes):
+                    print(
+                        f"{attribute:<20} "
+                        f"len={len(value)}, raw={value.hex(' ')}"
+                    )
+                else:
+                    print(f"{attribute:<20} {value}")
+
+            except Exception as exc:
+                print(
+                    f"{attribute:<20} "
+                    f"not available ({type(exc).__name__}: {exc})"
+                )
+
+        print("\n--- Sync Manager Communication Type 0x1C00 ---")
+
+        raw_sm_count = read_raw(0x1C00, 0)
+        check_size(0x1C00, 0, raw_sm_count, 1, "UNSIGNED8")
+
+        if raw_sm_count is not None:
+            sm_count = int.from_bytes(
+                raw_sm_count,
+                "little",
+                signed=False,
+            )
+
+            print(f"    Sync Manager dichiarati: {sm_count}")
+
+            if sm_count > 16:
+                print(
+                    f"    [ERROR] Numero Sync Manager non plausibile: "
+                    f"{sm_count}"
+                )
+            else:
+                sm_type_names = {
+                    0: "unused",
+                    1: "mailbox write",
+                    2: "mailbox read",
+                    3: "process data output / RxPDO",
+                    4: "process data input / TxPDO",
+                }
+
+                for subindex in range(1, sm_count + 1):
+                    raw = read_raw(0x1C00, subindex)
+                    check_size(
+                        0x1C00,
+                        subindex,
+                        raw,
+                        1,
+                        "UNSIGNED8",
+                    )
+
+                    if raw is not None:
+                        sm_type = int.from_bytes(
+                            raw,
+                            "little",
+                            signed=False,
+                        )
+                        print(
+                            f"    SM{subindex - 1}: "
+                            f"{sm_type_names.get(sm_type, 'unknown')} "
+                            f"(type={sm_type})"
+                        )
+
+        rx_assignments = dump_assignment(
+            0x1C12,
+            "RxPDO / master-to-slave",
+        )
+
+        tx_assignments = dump_assignment(
+            0x1C13,
+            "TxPDO / slave-to-master",
+        )
+
+        print("\n--- Assigned PDO mappings ---")
+
+        rx_total_bits = 0
+        tx_total_bits = 0
+
+        for mapping_index in rx_assignments:
+            _, bits = dump_mapping(
+                mapping_index,
+                "RxPDO",
+            )
+            rx_total_bits += bits
+
+        for mapping_index in tx_assignments:
+            _, bits = dump_mapping(
+                mapping_index,
+                "TxPDO",
+            )
+            tx_total_bits += bits
+
+        if include_candidate_maps:
+            print("\n--- Candidate PDO mapping objects ---")
+
+            already_dumped = set(rx_assignments + tx_assignments)
+
+            candidate_maps = (
+                ("RxPDO candidate", 0x1600),
+                ("RxPDO candidate", 0x1601),
+                ("RxPDO candidate", 0x1602),
+                ("TxPDO candidate", 0x1A00),
+                ("TxPDO candidate", 0x1A01),
+                ("TxPDO candidate", 0x1A02),
+            )
+
+            for direction, mapping_index in candidate_maps:
+                if mapping_index in already_dumped:
+                    continue
+
+                dump_mapping(mapping_index, direction)
+
+        print("\n--- Summary ---")
+
+        print(
+            f"RxPDO assignment: "
+            f"{', '.join(f'0x{x:04X}' for x in rx_assignments) or 'none'}"
+        )
+        print(
+            f"TxPDO assignment: "
+            f"{', '.join(f'0x{x:04X}' for x in tx_assignments) or 'none'}"
+        )
+
+        print(
+            f"RxPDO total:       {rx_total_bits} bit, "
+            f"{(rx_total_bits + 7) // 8} byte"
+        )
+        print(
+            f"TxPDO total:       {tx_total_bits} bit, "
+            f"{(tx_total_bits + 7) // 8} byte"
+        )
+
+        if rx_total_bits == 56:
+            print("[OK] RxPDO attivo misura 7 byte")
+        else:
+            print(
+                f"[WARN] RxPDO attivo non misura 56 bit: "
+                f"{rx_total_bits} bit"
+            )
+
+        if tx_total_bits == 56:
+            print("[OK] TxPDO attivo misura 7 byte")
+        else:
+            print(
+                f"[WARN] TxPDO attivo non misura 56 bit: "
+                f"{tx_total_bits} bit"
+            )
+
+        print("=" * 72)
+        print("END ETHERCAT PDO DIAGNOSTIC DUMP")
+        print("=" * 72)
+        print()
+
 
     def print_ethercat_state(self) -> None:
         self.master.read_state()
